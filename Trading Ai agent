@@ -1,0 +1,168 @@
+# ----------------------------
+# Trading Bot for FBS/MetaTrader
+# Combines RSI Strategy + Risk Management + News Filter
+# ----------------------------
+
+import time
+import pandas as pd
+import talib as ta
+from datetime import datetime
+from forexconnect import ForexConnect
+from backtesting import Backtest, Strategy
+
+# ----------------------------
+# Configuration
+# ----------------------------
+SYMBOL = "EUR/USD"
+TIMEFRAME = "H1"  # 1-hour candles
+RISK_PERCENT = 2  # 2% risk per trade
+STOP_LOSS_PIPS = 20
+RSI_PERIOD = 14
+TRADING_SESSIONS = {
+    "London": (8, 17),    # 8 AM - 5 PM GMT
+    "New York": (13, 22)  # 1 PM - 10 PM GMT
+}
+
+# FBS/MetaTrader Credentials (REPLACE WITH YOURS)
+FBS_CREDENTIALS = {
+    "user_id": "YOUR_USER_ID",
+    "password": "YOUR_PASSWORD",
+    "host": "http://www.fbs.com/API",
+    "account_type": "Demo"  # Change to "Live" for real trading
+}
+
+# ----------------------------
+# Connect to FBS/MetaTrader
+# ----------------------------
+def connect_to_fbs():
+    fx = ForexConnect()
+    try:
+        fx.login(
+            FBS_CREDENTIALS["user_id"],
+            FBS_CREDENTIALS["password"],
+            FBS_CREDENTIALS["host"],
+            FBS_CREDENTIALS["account_type"]
+        )
+        print("Connected to FBS/MetaTrader successfully!")
+        return fx
+    except Exception as e:
+        print(f"Connection failed: {e}")
+        return None
+
+# ----------------------------
+# Data Fetching & RSI Calculation
+# ----------------------------
+def fetch_data(fx, symbol, timeframe, bars=100):
+    try:
+        data = fx.get_candles(symbol, timeframe, bars)
+        df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        return df
+    except Exception as e:
+        print(f"Data fetch error: {e}")
+        return None
+
+def calculate_rsi(df):
+    df['RSI'] = ta.RSI(df['Close'], timeperiod=RSI_PERIOD)
+    return df
+
+# ----------------------------
+# Risk-Managed Trade Execution
+# ----------------------------
+def calculate_position_size(account_balance):
+    risk_amount = account_balance * (RISK_PERCENT / 100)
+    pip_value = 10  # Adjust for your instrument (1 pip = $10 for EUR/USD)
+    return round(risk_amount / (STOP_LOSS_PIPS * pip_value), 2)
+
+def execute_trade(fx, symbol, direction):
+    account_balance = fx.get_account_balance()
+    position_size = calculate_position_size(account_balance)
+    
+    try:
+        if direction == "BUY":
+            fx.open_trade(symbol, "buy", position_size)
+            fx.set_stop_loss(position_size, STOP_LOSS_PIPS)
+            fx.set_take_profit(position_size, STOP_LOSS_PIPS * 2)  # 1:2 risk-reward
+        elif direction == "SELL":
+            fx.open_trade(symbol, "sell", position_size)
+            fx.set_stop_loss(position_size, STOP_LOSS_PIPS)
+            fx.set_take_profit(position_size, STOP_LOSS_PIPS * 2)
+        print(f"{direction} order of {position_size} lots placed!")
+    except Exception as e:
+        print(f"Trade failed: {e}")
+
+# ----------------------------
+# News & Session Filter
+# ----------------------------
+def is_high_risk_time():
+    # Integrate with Forex Factory API for real news data (placeholder)
+    current_hour = datetime.utcnow().hour
+    news_hours = [7, 12, 14]  # Example high-impact news times (GMT)
+    return current_hour in news_hours
+
+def is_trading_session():
+    current_hour = datetime.utcnow().hour
+    for session in TRADING_SESSIONS.values():
+        if session[0] <= current_hour < session[1]:
+            return True
+    return False
+
+# ----------------------------
+# Backtesting Strategy
+# ----------------------------
+class RSIStrategy(Strategy):
+    def init(self):
+        self.rsi = self.I(ta.RSI, self.data.Close, RSI_PERIOD)
+
+    def next(self):
+        if not self.position:
+            if self.rsi < 30:
+                self.buy()
+            elif self.rsi > 70:
+                self.sell()
+        else:
+            if self.rsi > 70 or self.rsi < 30:
+                self.position.close()
+
+def run_backtest(df):
+    bt = Backtest(df, RSIStrategy, cash=10_000, commission=0.002)
+    stats = bt.run()
+    bt.plot()
+    print("Backtest Results:")
+    print(stats)
+
+# ----------------------------
+# Main Bot Loop
+# ----------------------------
+def main():
+    fx = connect_to_fbs()
+    if not fx:
+        return
+
+    # Backtest first
+    historical_data = fetch_data(fx, SYMBOL, TIMEFRAME, bars=1000)
+    historical_data = calculate_rsi(historical_data)
+    run_backtest(historical_data)
+
+    # Live trading loop
+    while True:
+        try:
+            if is_trading_session() and not is_high_risk_time():
+                df = fetch_data(fx, SYMBOL, TIMEFRAME)
+                df = calculate_rsi(df)
+                last_rsi = df['RSI'].iloc[-1]
+
+                if last_rsi < 30:
+                    execute_trade(fx, SYMBOL, "BUY")
+                elif last_rsi > 70:
+                    execute_trade(fx, SYMBOL, "SELL")
+            
+            time.sleep(3600)  # Check hourly
+        except KeyboardInterrupt:
+            print("Bot stopped by user.")
+            break
+        except Exception as e:
+            print(f"Critical error: {e}")
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
