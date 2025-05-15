@@ -1,0 +1,231 @@
+# ----------------------------
+# Advanced Trading Bot with Telegram Integration
+# ----------------------------
+
+import time
+import logging
+import pandas as pd
+import talib as ta
+from datetime import datetime
+from threading import Thread
+from dotenv import load_dotenv
+import os
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from forexconnect import ForexConnect, ForexConnectException
+
+# ----------------------------
+# Configuration & Security
+# ----------------------------
+load_dotenv()  # Load environment variables from .env file
+
+# Trading Configuration
+SYMBOL = os.getenv("SYMBOL", "EUR/USD")
+TIMEFRAME = os.getenv("TIMEFRAME", "H1")
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", 2))
+STOP_LOSS_PIPS = int(os.getenv("STOP_LOSS_PIPS", 20))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
+
+# FBS Credentials (from .env)
+FBS_CREDENTIALS = {
+    "user_id": os.getenv("FBS_USER_ID"),
+    "password": os.getenv("FBS_PASSWORD"),
+    "host": os.getenv("FBS_HOST", "http://www.fbs.com/API"),
+    "account_type": os.getenv("FBS_ACCOUNT_TYPE", "Demo")
+}
+
+# Telegram Configuration
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+# Global Control Flags
+TRADING_ACTIVE = False
+BOT_TERMINATE = False
+
+# Initialize logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ----------------------------
+# Telegram Bot System
+# ----------------------------
+class TradingBotTelegram:
+    def __init__(self):
+        self.bot = Bot(token=TELEGRAM_TOKEN)
+        self.updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+        self.dispatcher = self.updater.dispatcher
+
+        # Register commands
+        self.dispatcher.add_handler(CommandHandler("start", self.start))
+        self.dispatcher.add_handler(CommandHandler("stop", self.stop))
+        self.dispatcher.add_handler(CommandHandler("status", self.status))
+        self.dispatcher.add_handler(CommandHandler("help", self.help))
+        self.dispatcher.add_handler(CommandHandler("config", self.show_config))
+
+    def send_alert(self, message: str):
+        """Send formatted alerts with error handling."""
+        try:
+            self.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"🚨 *Trading Bot Alert:*\n{message}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Telegram send failed: {e}")
+
+    def start(self, update: Update, context: CallbackContext):
+        """Activate the trading bot."""
+        global TRADING_ACTIVE
+        if not TRADING_ACTIVE:
+            TRADING_ACTIVE = True
+            self.send_alert("✅ *Trading Activated!*")
+        else:
+            self.send_alert("ℹ️ Bot is already active!")
+
+    def stop(self, update: Update, context: CallbackContext):
+        """Deactivate the trading bot."""
+        global TRADING_ACTIVE
+        TRADING_ACTIVE = False
+        self.send_alert("⛔ *Trading Deactivated!*")
+
+    def status(self, update: Update, context: CallbackContext):
+        """Check bot status."""
+        status = "🟢 ACTIVE" if TRADING_ACTIVE else "🔴 INACTIVE"
+        self.send_alert(f"📊 *Bot Status:* {status}")
+
+    def help(self, update: Update, context: CallbackContext):
+        """Show help menu."""
+        help_text = """
+        📚 *Available Commands:*
+        /start - Activate trading
+        /stop - Deactivate trading
+        /status - Check bot status
+        /config - Show current settings
+        /help - This menu
+        """
+        self.send_alert(help_text)
+
+    def show_config(self, update: Update, context: CallbackContext):
+        """Display current configuration."""
+        config = f"""
+        ⚙️ *Current Configuration:*
+        Symbol: {SYMBOL}
+        Timeframe: {TIMEFRAME}
+        Risk: {RISK_PERCENT}%
+        Stop Loss: {STOP_LOSS_PIPS} pips
+        RSI Period: {RSI_PERIOD}
+        """
+        self.send_alert(config)
+
+    def run(self):
+        """Start the Telegram polling thread."""
+        self.updater.start_polling()
+        self.send_alert("🤖 *Trading Bot Started!*")
+        self.updater.idle()
+
+# ----------------------------
+# Trading Engine
+# ----------------------------
+class TradingEngine:
+    def __init__(self):
+        self.fx = None
+        self.telegram = TradingBotTelegram()
+
+    def connect_fbs(self):
+        """Establish connection to FBS/MetaTrader."""
+        try:
+            self.fx = ForexConnect()
+            self.fx.login(**FBS_CREDENTIALS)
+            self.telegram.send_alert("🔌 *Connected to FBS!*")
+            return True
+        except ForexConnectException as e:
+            self.telegram.send_alert(f"❌ *Connection Failed:* {e}")
+            return False
+
+    def fetch_market_data(self):
+        """Retrieve and process market data."""
+        try:
+            data = self.fx.get_candles(SYMBOL, TIMEFRAME, 100)
+            df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df['RSI'] = ta.RSI(df['Close'], RSI_PERIOD)
+            return df
+        except Exception as e:
+            self.telegram.send_alert(f"❌ *Data Error:* {e}")
+            return None
+
+    def calculate_position(self):
+        """Risk-managed position sizing."""
+        balance = self.fx.get_account_balance()
+        risk_amount = balance * (RISK_PERCENT / 100)
+        pip_value = 10  # Adjust for your instrument
+        return round(risk_amount / (STOP_LOSS_PIPS * pip_value), 2)
+
+    def execute_trade(self, direction: str):
+        """Execute trade with full error handling."""
+        try:
+            position_size = self.calculate_position()
+            trade_cmd = "buy" if direction == "BUY" else "sell"
+            
+            self.fx.open_trade(SYMBOL, trade_cmd, position_size)
+            self.fx.set_stop_loss(position_size, STOP_LOSS_PIPS)
+            self.fx.set_take_profit(position_size, STOP_LOSS_PIPS * 2)
+            
+            self.telegram.send_alert(
+                f"🎯 *Trade Executed:*\n"
+                f"Direction: {direction}\n"
+                f"Size: {position_size} lots\n"
+                f"SL: {STOP_LOSS_PIPS} pips\n"
+                f"TP: {STOP_LOSS_PIPS * 2} pips"
+            )
+        except Exception as e:
+            self.telegram.send_alert(f"❌ *Trade Failed:* {e}")
+
+    def trading_strategy(self):
+        """Core RSI-based trading logic."""
+        if not TRADING_ACTIVE:
+            return
+
+        df = self.fetch_market_data()
+        if df is not None:
+            last_rsi = df['RSI'].iloc[-1]
+            
+            if last_rsi < 30:
+                self.execute_trade("BUY")
+            elif last_rsi > 70:
+                self.execute_trade("SELL")
+
+    def run(self):
+        """Main trading loop."""
+        global BOT_TERMINATE
+        
+        if not self.connect_fbs():
+            BOT_TERMINATE = True
+            return
+
+        while not BOT_TERMINATE:
+            try:
+                self.trading_strategy()
+                time.sleep(3600)  # Hourly check
+            except KeyboardInterrupt:
+                BOT_TERMINATE = True
+            except Exception as e:
+                self.telegram.send_alert(f"⚠️ *Critical Error:* {e}")
+                time.sleep(60)
+
+# ----------------------------
+# Main Execution
+# ----------------------------
+if __name__ == "__main__":
+    # Start Telegram system in separate thread
+    telegram_bot = TradingBotTelegram()
+    Thread(target=telegram_bot.run).start()
+
+    # Start trading engine
+    trading_engine = TradingEngine()
+    trading_engine.run()
+
+    # Cleanup on termination
+    telegram_bot.send_alert("🛑 *Bot Shutdown Complete!*")
