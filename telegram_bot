@@ -1,0 +1,154 @@
+# ----------------------------
+# Trading Bot with Telegram Alerts & Controls
+# ----------------------------
+
+import time
+import pandas as pd
+import talib as ta
+from datetime import datetime
+from threading import Thread
+from forexconnect import ForexConnect
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+
+# ----------------------------
+# Configuration
+# ----------------------------
+SYMBOL = "EUR/USD"
+TIMEFRAME = "H1"
+RISK_PERCENT = 2
+STOP_LOSS_PIPS = 20
+RSI_PERIOD = 14
+
+# FBS Credentials (from .env)
+FBS_CREDENTIALS = {
+    "user_id": "YOUR_FBS_USER_ID",
+    "password": "YOUR_FBS_PASSWORD",
+    "host": "http://www.fbs.com/API",
+    "account_type": "Demo"
+}
+
+# Telegram Config
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
+
+# Global flag to control bot execution
+TRADING_ACTIVE = False
+
+# ----------------------------
+# Telegram Bot Setup
+# ----------------------------
+bot = Bot(token=TELEGRAM_TOKEN)
+
+def send_alert(message: str):
+    """Send a message to Telegram."""
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        print(f"Telegram alert failed: {e}")
+
+def start(update: Update, context: CallbackContext):
+    """/start command: Activate the bot."""
+    global TRADING_ACTIVE
+    TRADING_ACTIVE = True
+    send_alert("✅ Trading bot is now ACTIVE!")
+
+def stop(update: Update, context: CallbackContext):
+    """/stop command: Deactivate the bot."""
+    global TRADING_ACTIVE
+    TRADING_ACTIVE = False
+    send_alert("⛔ Trading bot is now INACTIVE!")
+
+def status(update: Update, context: CallbackContext):
+    """/status command: Check if bot is running."""
+    status = "ACTIVE" if TRADING_ACTIVE else "INACTIVE"
+    send_alert(f"📊 Bot Status: {status}")
+
+def setup_telegram_bot():
+    """Start polling for Telegram commands."""
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stop", stop))
+    dp.add_handler(CommandHandler("status", status))
+    updater.start_polling()
+    updater.idle()
+
+# ----------------------------
+# Trading Bot Functions
+# ----------------------------
+def connect_to_fbs():
+    fx = ForexConnect()
+    try:
+        fx.login(**FBS_CREDENTIALS)
+        send_alert("🔌 Connected to FBS/MetaTrader!")
+        return fx
+    except Exception as e:
+        send_alert(f"❌ Connection failed: {e}")
+        return None
+
+def fetch_data(fx, symbol, timeframe, bars=100):
+    try:
+        data = fx.get_candles(symbol, timeframe, bars)
+        df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        return df
+    except Exception as e:
+        send_alert(f"❌ Data fetch error: {e}")
+        return None
+
+def calculate_position_size(account_balance):
+    risk_amount = account_balance * (RISK_PERCENT / 100)
+    pip_value = 10  # Adjust for your instrument
+    return round(risk_amount / (STOP_LOSS_PIPS * pip_value), 2)
+
+def execute_trade(fx, symbol, direction):
+    account_balance = fx.get_account_balance()
+    position_size = calculate_position_size(account_balance)
+    try:
+        if direction == "BUY":
+            fx.open_trade(symbol, "buy", position_size)
+            fx.set_stop_loss(position_size, STOP_LOSS_PIPS)
+            fx.set_take_profit(position_size, STOP_LOSS_PIPS * 2)
+            send_alert(f"📈 BUY {position_size} lots of {symbol}!")
+        elif direction == "SELL":
+            fx.open_trade(symbol, "sell", position_size)
+            fx.set_stop_loss(position_size, STOP_LOSS_PIPS)
+            fx.set_take_profit(position_size, STOP_LOSS_PIPS * 2)
+            send_alert(f"📉 SELL {position_size} lots of {symbol}!")
+    except Exception as e:
+        send_alert(f"❌ Trade failed: {e}")
+
+# ----------------------------
+# Main Trading Loop
+# ----------------------------
+def trading_loop():
+    fx = connect_to_fbs()
+    if not fx:
+        return
+
+    while True:
+        if TRADING_ACTIVE:
+            try:
+                df = fetch_data(fx, SYMBOL, TIMEFRAME)
+                if df is not None:
+                    df['RSI'] = ta.RSI(df['Close'], RSI_PERIOD)
+                    last_rsi = df['RSI'].iloc[-1]
+
+                    if last_rsi < 30:
+                        execute_trade(fx, SYMBOL, "BUY")
+                    elif last_rsi > 70:
+                        execute_trade(fx, SYMBOL, "SELL")
+            except Exception as e:
+                send_alert(f"❌ Bot error: {e}")
+
+        time.sleep(3600)  Check hourly
+
+# ----------------------------
+# Run Both Systems
+# ----------------------------
+if __name__ == "__main__":
+    # Start Telegram bot in a separate thread
+    Thread(target=setup_telegram_bot).start()
+    
+    # Start trading loop
+    trading_loop()
